@@ -1,0 +1,184 @@
+version: 2.1
+
+            
+jobs:
+  create-infrastructure:
+    docker:
+      - image: amazon/aws-cli
+    steps:
+      - checkout
+      - run:
+          name: Creates AWS Infrastructure
+          command: |
+            if [[ $(aws cloudformation --region ${AWS_DEFAULT_REGION} \
+              describe-stacks --stack-name ${STACK_NAME} --output text) ]]
+            then
+              echo Stack Exists, nothing to do
+            else
+              aws cloudformation create-stack --stack-name ${STACK_NAME} \
+                --region ${AWS_DEFAULT_REGION} --template-body file://infrastructure.yml \
+                --capabilities CAPABILITY_NAMED_IAM --parameters \
+                ParameterKey=pDBName,ParameterValue=${DB_NAME} \
+                ParameterKey=pDBUser,ParameterValue=${DB_USER} \
+                ParameterKey=pDBPass,ParameterValue=${DB_PASS}
+              while true; do 
+                if [[ $(aws cloudformation describe-stacks --region ${AWS_DEFAULT_REGION} \
+                  --stack-name ${STACK_NAME} --query "Stacks[*].StackStatus" \
+                  --output text) == CREATE_IN_PROGRESS ]]
+                then
+                  echo -e "EKS Cluster status : CREATE IN PROGRESS \n"
+                  sleep 10
+                elif [[ $(aws cloudformation describe-stacks --region ${AWS_DEFAULT_REGION} \
+                  --stack-name ${STACK_NAME} --query "Stacks[*].StackStatus" \
+                  --output text) == CREATE_COMPLETE ]]
+                then
+                  echo -e "EKS Cluster status : SUCCESSFULLY CREATED \n"
+                  break
+                fi
+              done
+            fi
+      - run:
+          name: Store RDS Instance
+          command: |
+            export RDS_ID=$(aws cloudformation --region ${AWS_DEFAULT_REGION} \
+              describe-stacks --stack-name ${STACK_NAME} \
+              --query "Stacks[0].Outputs[?OutputKey=='InstanceId'].OutputValue" \
+              --output text)
+            export RDS_DNS=$(aws rds describe-db-instances --db-instance-identifier ${RDS_ID} \
+              --query "DBInstances[0].[Endpoint.Address]" --output text)
+            export DATABASE_URL=postgres://${DB_USER}:${DB_PASS}@${RDS_DNS}:5432/${DB_NAME}
+            curl -H "Content-Type: text/plain" \
+              -H "token: d5337210-32aa-45f1-943a-afe0c170b51e" \
+              --request PUT --data "${DATABASE_URL}" \
+              https://api.memstash.io/values/DATABASE_URL
+
+  linting:
+    docker:
+      - image: alpine:latest
+    steps:
+      - checkout
+      - run:
+          name: Install Dependencies
+          command: |
+              wget -O /bin/hadolint https://github.com/hadolint/hadolint/releases/download/v2.4.1/hadolint-Linux-x86_64
+              chmod +x /bin/hadolint
+      - run:
+          name: Lint Dockerfile
+          command: |
+              hadolint Dockerfile
+
+  build-image:
+    docker:
+      - image: circleci/buildpack-deps
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          name: Build Docker Image
+          command: |
+              docker build . -t ${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}
+              docker image tag ${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME} \
+                ${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}:<< pipeline.number >>
+      - run:
+          name: Push Docker Image
+          command: |
+              docker login -u ${DOCKER_USER} -p ${DOCKER_PASS}
+              docker push ${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}
+              docker push ${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}:<< pipeline.number >>
+
+  make-migrations:
+    docker:
+      - image: ${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}
+    steps:
+      - checkout
+      - run:
+          name: Make Migrations
+          working_directory: /helios-server
+          command: |
+            export DATABASE_URL=$(curl -H "Content-Type: text/plain" \
+              -H "token: d5337210-32aa-45f1-943a-afe0c170b51e" \
+              --request GET https://api.memstash.io/values/DATABASE_URL)
+            source bin/activate
+            python manage.py makemigrations
+            python manage.py migrate
+
+  deploy:
+    docker:
+      - image: python:slim-buster
+    steps:
+      - checkout
+      - run:
+          name: Install Dependencies
+          command: |
+            apt update
+            apt install -y apt-transport-https ca-certificates curl
+            curl -fsSLo /usr/share/keyrings/kubernetes-archive-keyring.gpg \
+              https://packages.cloud.google.com/apt/doc/apt-key.gpg
+            echo "deb [signed-by=/usr/share/keyrings/kubernetes-archive-keyring.gpg] \
+              https://apt.kubernetes.io/ kubernetes-xenial main" | \
+              tee /etc/apt/sources.list.d/kubernetes.list
+            apt update
+            apt install -y kubectl
+            pip3 install awscli
+      - run:
+          name: Update Kubectl Config File
+# Change the cluster name if it's not the default value assigned in infrastructure.yml
+          command: |
+            aws eks --region ${AWS_DEFAULT_REGION} update-kubeconfig \
+              --name EKS
+      - run:
+          name: Create Kubernetes Namespace and Secret
+          command: |
+            if [[ ! $(kubectl get namespaces) =~ igti-pa ]]
+            then
+              kubectl create namespace igti-pa
+            fi
+            if [[ ! $(kubectl -n igti-pa get secrets) =~ helios-env ]]
+            then
+              kubectl -n igti-pa create secret generic helios-env
+            fi
+      - run:
+          name: Create/Update Deployment
+          command: |
+            if [[ ! $(kubectl -n igti-pa get deployments) =~ helios-deployment ]]
+            then
+              kubectl apply -f deployment-eks.yml
+            else
+              kubectl -n igti-pa set image \
+              deployment/helios-deployment \
+              ${CIRCLE_PROJECT_REPONAME}=${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}:<< pipeline.number >>
+            fi
+            kubectl -n igti-pa rollout status deployment helios-deployment
+      - run:
+          name: Update Environment Variables
+          command: |
+            export DATABASE_URL=$(curl -H "Content-Type: text/plain" \
+              -H "token: d5337210-32aa-45f1-943a-afe0c170b51e" \
+              --request GET https://api.memstash.io/values/DATABASE_URL)
+            export LB_HOSTNAME=http://$(kubectl -n igti-pa get svc \
+              ${CIRCLE_PROJECT_REPONAME} | tail -1 | awk '{print $4}')
+            if [[ $(kubectl -n igti-pa get secrets) =~ helios-env ]]
+            then
+              kubectl -n igti-pa delete secret helios-env
+            fi
+            kubectl -n igti-pa create secret generic helios-env \
+              --from-literal=DATABASE_URL=${DATABASE_URL} \
+              --from-literal=URL_HOST=${LB_HOSTNAME}
+      - run:
+          name: Restart Pods For Variables Take Effect
+          command: |
+            kubectl -n igti-pa rollout restart deployment helios-deployment
+            kubectl -n igti-pa rollout status deployment helios-deployment
+            
+
+workflows:
+  default:
+    jobs:
+      - create-infrastructure
+      - linting
+      - build-image:
+          requires: [linting]
+      - make-migrations:
+          requires: [build-image, create-infrastructure]
+      - deploy:
+          requires: [make-migrations]
